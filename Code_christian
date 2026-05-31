@@ -93,7 +93,7 @@ industrial = industrial[
 # Keep 100 while testing.
 # After confirming the CSV works in ArcGIS Online,
 # change to: sample = industrial.copy()
-sample = industrial.head(100).copy()
+sample = industrial.copy()
 
 geocoded_results = batch_geocode(
     sample["full_address"].tolist(),
