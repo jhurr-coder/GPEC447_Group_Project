@@ -1,0 +1,2 @@
+iz = gis.users.get('gpec447sp26_YOURACCOUNT#')
+iz.availableCredits
