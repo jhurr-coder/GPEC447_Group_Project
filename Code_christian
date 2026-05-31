@@ -1,1 +1,123 @@
+import pandas as pd
+from pathlib import Path
+from arcgis.gis import GIS
+from arcgis.geocoding import batch_geocode
+from arcgis.features import GeoAccessor
 
+# -----------------------------
+# 1. Connect to ArcGIS Online
+# -----------------------------
+gis = GIS(username='gpec447sp26_23')  # works in ArcGIS Online notebooks / some DataHub setups
+
+# If GIS("home") does not work, use:
+# gis = GIS("https://www.arcgis.com", "YOUR_USERNAME", "YOUR_PASSWORD")
+
+# -----------------------------
+# 2. Load and combine CSV files
+# -----------------------------
+files = [
+    Path("tr_active1.csv"),
+    Path("tr_active2.csv")
+]
+
+businesses = pd.concat(
+    [
+        pd.read_csv(
+            f,
+            dtype=str,
+            engine="python",
+            on_bad_lines="skip"
+        )
+        for f in files
+    ],
+    ignore_index=True
+)
+
+# -----------------------------
+# 3. Clean column names
+# -----------------------------
+businesses.columns = (
+    businesses.columns
+    .str.strip()
+    .str.lower()
+    .str.replace(" ", "_")
+    .str.replace("#", "num")
+)
+
+# Check your column names
+print(businesses.columns.tolist())
+
+# -----------------------------
+# 4. Filter by industrial/logistics NAICS
+# -----------------------------
+businesses["naics"] = businesses["naics"].astype(str).str.strip()
+
+industrial_prefixes = (
+    "31", "32", "33",   # Manufacturing
+    "42",               # Wholesale trade
+    "48", "49"          # Transportation and warehousing
+)
+
+industrial = businesses[
+    businesses["naics"].str.startswith(industrial_prefixes, na=False)
+].copy()
+
+def classify_industry(naics):
+    if naics.startswith(("31", "32", "33")):
+        return "Manufacturing"
+    elif naics.startswith("42"):
+        return "Wholesale Trade"
+    elif naics.startswith(("48", "49")):
+        return "Transportation and Warehousing"
+    else:
+        return "Other"
+
+industrial["industry_group"] = industrial["naics"].apply(classify_industry)
+
+# -----------------------------
+# 5. Build full address
+# -----------------------------
+# Adjust these names if your file uses different address columns.
+industrial["full_address"] = (
+    industrial["address"].fillna("") + ", " +
+    industrial["city"].fillna("") + ", " +
+    industrial["state"].fillna("") + " " +
+    industrial["zip"].fillna("")
+)
+
+industrial = industrial[
+    industrial["full_address"].str.len() > 10
+].copy()
+
+print("Businesses to geocode:", len(industrial))
+
+# -----------------------------
+# 6. Geocode addresses
+# -----------------------------
+sample = sample.reset_index(drop=True)
+geo_sdf = geo_sdf.reset_index(drop=True)
+
+business_points = pd.concat(
+    [sample, geo_sdf[["SHAPE", "Score", "Match_addr", "Status"]]],
+    axis=1
+)
+
+business_points = GeoAccessor.from_df(
+    business_points,
+    geometry_column="SHAPE"
+)
+
+business_points.head()
+
+# -----------------------------
+# 7. Plot in an ArcGIS map
+# -----------------------------
+m = gis.map("Otay Mesa, San Diego, CA")
+
+business_points.spatial.plot(
+    map_widget=m,
+    renderer_type="u",
+    col="industry_group"
+)
+
+m
