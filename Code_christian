@@ -2,7 +2,6 @@ import pandas as pd
 from pathlib import Path
 from arcgis.gis import GIS
 from arcgis.geocoding import batch_geocode
-from arcgis.features import GeoAccessor
 
 # -----------------------------
 # 1. Connect to ArcGIS Online
@@ -41,6 +40,7 @@ businesses.columns = (
     .str.replace("#", "num")
 )
 
+print("Columns:")
 print(businesses.columns.tolist())
 
 # -----------------------------
@@ -70,6 +70,9 @@ def classify_industry(naics):
 
 industrial["industry_group"] = industrial["naics"].apply(classify_industry)
 
+print("Industrial/logistics businesses:", len(industrial))
+print(industrial["industry_group"].value_counts())
+
 # -----------------------------
 # 5. Create full address
 # -----------------------------
@@ -84,13 +87,12 @@ industrial = industrial[
     industrial["full_address"].str.len() > 10
 ].copy()
 
-print("Industrial/logistics businesses:", len(industrial))
-
 # -----------------------------
 # 6. Geocode addresses
 # -----------------------------
-# Start with 100 to test.
-# After it works, replace with: sample = industrial.copy()
+# Keep 100 while testing.
+# After confirming the CSV works in ArcGIS Online,
+# change to: sample = industrial.copy()
 sample = industrial.head(100).copy()
 
 geocoded_results = batch_geocode(
@@ -101,10 +103,11 @@ geocoded_results = batch_geocode(
 geo_sdf = geocoded_results.sdf.reset_index(drop=True)
 sample = sample.reset_index(drop=True)
 
+print("Geocoding preview:")
 print(geo_sdf[["Status", "Score", "Match_addr", "X", "Y"]].head())
 
 # -----------------------------
-# 7. Rebuild point data using X/Y
+# 7. Add geocoding results to business records
 # -----------------------------
 business_points = sample.copy()
 
@@ -114,56 +117,66 @@ business_points["geocode_score"] = geo_sdf["Score"]
 business_points["matched_address"] = geo_sdf["Match_addr"]
 business_points["geocode_status"] = geo_sdf["Status"]
 
+business_points["longitude"] = pd.to_numeric(
+    business_points["longitude"],
+    errors="coerce"
+)
+
+business_points["latitude"] = pd.to_numeric(
+    business_points["latitude"],
+    errors="coerce"
+)
+
+# Keep only successfully matched records with valid coordinates
 business_points = business_points[
-    business_points["geocode_status"] == "M"
+    (business_points["geocode_status"] == "M")
+    & business_points["longitude"].notna()
+    & business_points["latitude"].notna()
 ].copy()
-
-business_points["longitude"] = pd.to_numeric(business_points["longitude"], errors="coerce")
-business_points["latitude"] = pd.to_numeric(business_points["latitude"], errors="coerce")
-
-business_points = business_points.dropna(
-    subset=["longitude", "latitude"]
-).copy()
 
 print("Successfully geocoded businesses:", len(business_points))
 
 # -----------------------------
-# 8. Create Spatially Enabled DataFrame
+# 8. Keep useful columns for ArcGIS Online
 # -----------------------------
-business_sdf = GeoAccessor.from_xy(
-    business_points,
-    x_column="longitude",
-    y_column="latitude",
-    sr=4326
-)
+output_cols = [
+    "business_acctnum",
+    "dba_name",
+    "ownership_type",
+    "address",
+    "city",
+    "state",
+    "zip",
+    "naics",
+    "activity_desc",
+    "industry_group",
+    "full_address",
+    "matched_address",
+    "geocode_score",
+    "longitude",
+    "latitude"
+]
+
+business_points = business_points[output_cols].copy()
 
 # -----------------------------
-# 9. Plot in ArcGIS map
+# 9. Export CSV for ArcGIS Online upload
 # -----------------------------
-m = gis.map("Otay Mesa, San Diego, CA")
+output_file = "industrial_businesses_geocoded.csv"
 
-business_sdf.spatial.plot(
-    map_widget=m,
-    renderer_type="u",
-    col="industry_group"
-)
-
-m
-
-# -----------------------------
-# 10. Optional: export cleaned CSV
-# -----------------------------
 business_points.to_csv(
-    "san_diego_industrial_logistics_geocoded_sample.csv",
+    output_file,
     index=False
 )
 
+print(f"CSV exported successfully: {output_file}")
+
 # -----------------------------
-# 11. Optional: publish to ArcGIS Online
+# 10. Quick quality checks
 # -----------------------------
-# Only run this after the map works.
-# item = business_sdf.spatial.to_featurelayer(
-#     title="San Diego Industrial Logistics Businesses Test",
-#     gis=gis
-# )
-# item
+print("Final row count:", len(business_points))
+print("Industry counts:")
+print(business_points["industry_group"].value_counts())
+
+print("Coordinate preview:")
+print(business_points[["dba_name", "industry_group", "longitude", "latitude"]].head())
