@@ -9,11 +9,8 @@ from arcgis.features import GeoAccessor
 # -----------------------------
 gis = GIS(username='gpec447sp26_23')  # works in ArcGIS Online notebooks / some DataHub setups
 
-# If GIS("home") does not work, use:
-# gis = GIS("https://www.arcgis.com", "YOUR_USERNAME", "YOUR_PASSWORD")
-
 # -----------------------------
-# 2. Load and combine CSV files
+# 2. Load CSV files
 # -----------------------------
 files = [
     Path("tr_active1.csv"),
@@ -44,7 +41,6 @@ businesses.columns = (
     .str.replace("#", "num")
 )
 
-# Check your column names
 print(businesses.columns.tolist())
 
 # -----------------------------
@@ -75,9 +71,8 @@ def classify_industry(naics):
 industrial["industry_group"] = industrial["naics"].apply(classify_industry)
 
 # -----------------------------
-# 5. Build full address
+# 5. Create full address
 # -----------------------------
-# Adjust these names if your file uses different address columns.
 industrial["full_address"] = (
     industrial["address"].fillna("") + ", " +
     industrial["city"].fillna("") + ", " +
@@ -89,35 +84,86 @@ industrial = industrial[
     industrial["full_address"].str.len() > 10
 ].copy()
 
-print("Businesses to geocode:", len(industrial))
+print("Industrial/logistics businesses:", len(industrial))
 
 # -----------------------------
 # 6. Geocode addresses
 # -----------------------------
+# Start with 100 to test.
+# After it works, replace with: sample = industrial.copy()
+sample = industrial.head(100).copy()
+
+geocoded_results = batch_geocode(
+    sample["full_address"].tolist(),
+    as_featureset=True
+)
+
+geo_sdf = geocoded_results.sdf.reset_index(drop=True)
 sample = sample.reset_index(drop=True)
-geo_sdf = geo_sdf.reset_index(drop=True)
 
-business_points = pd.concat(
-    [sample, geo_sdf[["SHAPE", "Score", "Match_addr", "Status"]]],
-    axis=1
-)
-
-business_points = GeoAccessor.from_df(
-    business_points,
-    geometry_column="SHAPE"
-)
-
-business_points.head()
+print(geo_sdf[["Status", "Score", "Match_addr", "X", "Y"]].head())
 
 # -----------------------------
-# 7. Plot in an ArcGIS map
+# 7. Rebuild point data using X/Y
+# -----------------------------
+business_points = sample.copy()
+
+business_points["longitude"] = geo_sdf["X"]
+business_points["latitude"] = geo_sdf["Y"]
+business_points["geocode_score"] = geo_sdf["Score"]
+business_points["matched_address"] = geo_sdf["Match_addr"]
+business_points["geocode_status"] = geo_sdf["Status"]
+
+business_points = business_points[
+    business_points["geocode_status"] == "M"
+].copy()
+
+business_points["longitude"] = pd.to_numeric(business_points["longitude"], errors="coerce")
+business_points["latitude"] = pd.to_numeric(business_points["latitude"], errors="coerce")
+
+business_points = business_points.dropna(
+    subset=["longitude", "latitude"]
+).copy()
+
+print("Successfully geocoded businesses:", len(business_points))
+
+# -----------------------------
+# 8. Create Spatially Enabled DataFrame
+# -----------------------------
+business_sdf = GeoAccessor.from_xy(
+    business_points,
+    x_column="longitude",
+    y_column="latitude",
+    sr=4326
+)
+
+# -----------------------------
+# 9. Plot in ArcGIS map
 # -----------------------------
 m = gis.map("Otay Mesa, San Diego, CA")
 
-business_points.spatial.plot(
+business_sdf.spatial.plot(
     map_widget=m,
     renderer_type="u",
     col="industry_group"
 )
 
 m
+
+# -----------------------------
+# 10. Optional: export cleaned CSV
+# -----------------------------
+business_points.to_csv(
+    "san_diego_industrial_logistics_geocoded_sample.csv",
+    index=False
+)
+
+# -----------------------------
+# 11. Optional: publish to ArcGIS Online
+# -----------------------------
+# Only run this after the map works.
+# item = business_sdf.spatial.to_featurelayer(
+#     title="San Diego Industrial Logistics Businesses Test",
+#     gis=gis
+# )
+# item
