@@ -1,2 +1,23 @@
+from datetime import datetime
+import warnings
+
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
+from IPython.display import HTML
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import arcgis
+from arcgis import GIS
+from arcgis.raster.functions import *
+from arcgis.features.use_proximity import create_buffers
+from arcgis.geoenrichment import enrich
+from arcgis.features import GeoAccessor
+from arcgis.raster.analytics import create_image_collection
+from arcgis.raster.analytics import list_datastore_content
+
+gis = GIS(username='gpec447sp26_YOURACCOUNT#')
+
 iz = gis.users.get('gpec447sp26_YOURACCOUNT#')
 iz.availableCredits
