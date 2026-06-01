@@ -3,6 +3,8 @@ from arcgis.features import FeatureLayer
 import geopandas as gpd
 from shapely.geometry import Point
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import contextily as ctx
 import pandas as pd
 
 # ── 1. Connect ────────────────────────────────────────────────────────────────
@@ -11,19 +13,14 @@ gis = GIS(username='gpec447sp26_11')
 # ── 2. Find group ─────────────────────────────────────────────────────────────
 group = gis.groups.search("gpec 447_hurr_li_phouasalith")[0]
 print(f"Group found: {group.title}")
-for item in group.content():
-    print(f"  [{item.type}] {item.title} — id: {item.id}")
 
-# ── 3. Load core feature layer only ──────────────────────────────────────────
+# ── 3. Load core feature layer ────────────────────────────────────────────────
 core_item = gis.content.search("industrial_businesses_core_geocoded",
                                 item_type="Feature Layer")[0]
-print(f"\nCore: {core_item.title} ({core_item.id})")
-
-# ── 4. Query to SDF ───────────────────────────────────────────────────────────
+print(f"Core: {core_item.title}")
 core_sdf = core_item.layers[0].query(as_df=True)
-print(f"Columns: {core_sdf.columns.tolist()}")
 
-# ── 5. Convert to GeoDataFrame ───────────────────────────────────────────────
+# ── 4. Convert to GeoDataFrame ───────────────────────────────────────────────
 def sdf_to_gdf(sdf):
     sdf = sdf.copy()
     if "SHAPE" in sdf.columns:
@@ -40,56 +37,69 @@ def sdf_to_gdf(sdf):
 
 core_gdf = sdf_to_gdf(core_sdf)
 
-# ── 6. Fix mislabeled CRS (labeled 4326 but coords are Web Mercator 3857) ────
+# ── 5. Fix mislabeled CRS then set to EPSG:2230 (NAD83 CA State Plane Zone 6)
+# Pipeline: Web Mercator coords → label as 3857 → reproject to 4326 → to 2230
 core_gdf = core_gdf.set_crs("EPSG:3857", allow_override=True).to_crs("EPSG:4326")
-print(f"\nCore GDF: {len(core_gdf):,} points")
-print(f"x range: {round(core_gdf.geometry.x.min(),2)} to {round(core_gdf.geometry.x.max(),2)}")
-print(f"y range: {round(core_gdf.geometry.y.min(),2)} to {round(core_gdf.geometry.y.max(),2)}")
+core_gdf_2230 = core_gdf.to_crs("EPSG:2230")
+print(f"Core GDF: {len(core_gdf_2230):,} points | CRS: {core_gdf_2230.crs}")
 
-# ── 7. Load boundary layers ───────────────────────────────────────────────────
+# ── 6. Load boundary layers in EPSG:2230 ─────────────────────────────────────
 print("\nLoading boundary layers...")
 
-# San Diego County boundary (Census TIGER)
 tiger_url = (
     "https://www2.census.gov/geo/tiger/TIGER2022/COUNTY/"
     "tl_2022_us_county.zip"
 )
 try:
     counties  = gpd.read_file(tiger_url)
-    sd_county = counties[counties["GEOID"] == "06073"].to_crs("EPSG:4326")
-    print(f"SD County boundary loaded: {len(sd_county)} polygon(s)")
+    sd_county = counties[counties["GEOID"] == "06073"].to_crs("EPSG:2230")
+    print(f"SD County boundary loaded")
 except Exception as e:
-    print(f"TIGER download failed: {e} — using bounding box fallback")
+    print(f"TIGER failed: {e} — using bounding box")
     from shapely.geometry import box
     sd_county = gpd.GeoDataFrame(
-        geometry=[box(-117.60, 32.50, -116.08, 33.51)],
-        crs="EPSG:4326"
-    )
+        geometry=[box(-117.60, 32.50, -116.08, 33.51)], crs="EPSG:4326"
+    ).to_crs("EPSG:2230")
 
-# San Diego community planning districts (city neighborhoods)
-cpd_url = (
-    "https://seshat.datasd.org/sde/sgid_planning/"
-    "communities_datasd.zip"
-)
+cpd_url = "https://seshat.datasd.org/sde/sgid_planning/communities_datasd.zip"
 try:
-    cpd = gpd.read_file(cpd_url).to_crs("EPSG:4326")
+    cpd = gpd.read_file(cpd_url).to_crs("EPSG:2230")
     print(f"Community planning districts loaded: {len(cpd)} districts")
     has_cpd = True
 except Exception as e:
-    print(f"CPD load failed: {e} — will skip neighborhood layer")
+    print(f"CPD load failed: {e}")
     has_cpd = False
 
-# ── 8. Clip core points to San Diego County ───────────────────────────────────
-core_gdf = gpd.clip(core_gdf, sd_county)
-print(f"After clipping to SD County: {len(core_gdf):,} points")
+# Install contextily if needed: pip install contextily
+try:
+    import contextily as ctx
+    has_ctx = True
+    print("Contextily available — basemap will be added")
+except ImportError:
+    has_ctx = False
+    print("Contextily not installed — run: pip install contextily")
 
-# ── 9. Define study areas and colors ─────────────────────────────────────────
-area_coords = {
+# ── 7. Clip to SD County ──────────────────────────────────────────────────────
+core_gdf_2230 = gpd.clip(core_gdf_2230, sd_county)
+print(f"After clipping: {len(core_gdf_2230):,} points")
+
+# ── 8. Study areas — reproject centers and buffers to EPSG:2230 ──────────────
+area_coords_wgs = {
     "Otay Mesa":       (-117.0548, 32.5751),
     "Kearny Mesa":     (-117.1397, 32.8264),
     "Miramar":         (-117.1050, 32.8970),
     "Sorrento Valley": (-117.2025, 32.8948),
 }
+
+# Build buffers in EPSG:2230 (feet — 1 mile = 5280 feet)
+buffers_2230 = {}
+centers_2230 = {}
+for name, (lon, lat) in area_coords_wgs.items():
+    pt = gpd.GeoDataFrame(
+        geometry=[Point(lon, lat)], crs="EPSG:4326"
+    ).to_crs("EPSG:2230")
+    centers_2230[name] = pt.geometry.iloc[0]
+    buffers_2230[name] = pt.geometry.buffer(5280).iloc[0]  # 1 mile in feet
 
 colors = {
     "Manufacturing":                  "#2c7bb6",
@@ -97,133 +107,128 @@ colors = {
     "Transportation and Warehousing": "#d7191c",
 }
 
-# ── 10. Main map — core businesses with geography layers ─────────────────────
+# ── 9. MAIN MAP — full SD County ──────────────────────────────────────────────
 fig, ax = plt.subplots(figsize=(14, 12))
-ax.set_aspect("auto")
+ax.set_aspect("equal")
 
-# Layer 1: Community planning districts (lightest, bottom)
+# Layer 1: Community planning districts
 if has_cpd:
-    cpd.plot(ax=ax, color="#f5f5f0", edgecolor="#cccccc",
-             linewidth=0.4, alpha=0.8, zorder=1)
+    cpd.plot(ax=ax, color="#f0ede8", edgecolor="#c8c0b8",
+             linewidth=0.4, alpha=0.9, zorder=1)
 
-# Layer 2: San Diego County boundary
-sd_county.boundary.plot(ax=ax, color="#555555",
-                        linewidth=1.5, linestyle="-", zorder=2)
+# Layer 2: SD County boundary
+sd_county.boundary.plot(ax=ax, color="#333333",
+                        linewidth=2.0, zorder=2)
 
-# Layer 3: Business points by industry group
-if "industry_group" in core_gdf.columns:
+# Layer 3: Basemap (OpenStreetMap tiles)
+if has_ctx:
+    ctx.add_basemap(ax, crs=core_gdf_2230.crs.to_string(),
+                    source=ctx.providers.CartoDB.Positron,
+                    zoom=11, alpha=0.6, zorder=0)
+
+# Layer 4: Business points
+if "industry_group" in core_gdf_2230.columns:
     for group_name, color in colors.items():
-        subset = core_gdf[core_gdf["industry_group"] == group_name]
+        subset = core_gdf_2230[core_gdf_2230["industry_group"] == group_name]
         if len(subset):
             ax.scatter(subset.geometry.x, subset.geometry.y,
-                       c=color, s=8, alpha=0.75, zorder=3,
+                       c=color, s=10, alpha=0.8, zorder=4,
                        label=f"{group_name} (n={len(subset):,})")
 else:
-    ax.scatter(core_gdf.geometry.x, core_gdf.geometry.y,
-               c="#2c7bb6", s=8, alpha=0.75, zorder=3,
-               label=f"Industrial businesses (n={len(core_gdf):,})")
+    ax.scatter(core_gdf_2230.geometry.x, core_gdf_2230.geometry.y,
+               c="#2c7bb6", s=10, alpha=0.8, zorder=4,
+               label=f"Industrial businesses (n={len(core_gdf_2230):,})")
 
-# Layer 4: Study area 1-mile buffers
-for name, (x, y) in area_coords.items():
-    center = gpd.GeoDataFrame(
-        geometry=[Point(x, y)], crs="EPSG:4326"
-    ).to_crs("EPSG:26911")
-    buffer = center.geometry.buffer(1609).to_crs("EPSG:4326")
-    bx, by = buffer.iloc[0].exterior.xy
-    ax.fill(bx, by, color="yellow", alpha=0.15, zorder=4)
-    ax.plot(bx, by, color="black", linewidth=1.8,
-            linestyle="--", zorder=5)
-    ax.annotate(name, xy=(x, y), fontsize=9,
-                fontweight="bold", ha="center", color="black", zorder=6,
+# Layer 5: Study area buffers
+for name, buf in buffers_2230.items():
+    bx, by = buf.exterior.xy
+    ax.fill(bx, by, color="yellow", alpha=0.15, zorder=5)
+    ax.plot(bx, by, color="black", linewidth=2.0,
+            linestyle="--", zorder=6)
+    cx, cy = centers_2230[name].x, centers_2230[name].y
+    ax.annotate(name, xy=(cx, cy), fontsize=9,
+                fontweight="bold", ha="center", color="black", zorder=7,
                 bbox=dict(boxstyle="round,pad=0.25", fc="white",
-                          ec="black", alpha=0.8, linewidth=0.8))
+                          ec="black", alpha=0.85, linewidth=0.8))
 
-# Set extent to SD County with padding
+# Set extent
 minx, miny, maxx, maxy = sd_county.total_bounds
-ax.set_xlim(minx - 0.02, maxx + 0.02)
-ax.set_ylim(miny - 0.02, maxy + 0.02)
+ax.set_xlim(minx - 1000, maxx + 1000)
+ax.set_ylim(miny - 1000, maxy + 1000)
 
 ax.set_title("San Diego County — Core Industrial & Logistics Businesses\n"
-             "by NAICS Sector with Study Area Buffers (1-mile radius)",
+             "by NAICS Sector with Study Area Buffers (1-mile radius) | CRS: EPSG:2230",
              fontsize=13, fontweight="bold")
-ax.legend(fontsize=9, loc="upper right",
-          framealpha=0.9, edgecolor="gray")
-ax.set_xlabel("Longitude", fontsize=10)
-ax.set_ylabel("Latitude", fontsize=10)
-ax.grid(alpha=0.2, zorder=0)
+ax.legend(fontsize=9, loc="upper right", framealpha=0.95, edgecolor="gray")
+ax.set_xlabel("Easting (US Survey Feet)", fontsize=9)
+ax.set_ylabel("Northing (US Survey Feet)", fontsize=9)
+ax.grid(alpha=0.15, zorder=0)
 
 plt.tight_layout()
-plt.savefig("core_sd_county_map.png", dpi=150, bbox_inches="tight")
+plt.savefig("core_sd_county_map_2230.png", dpi=150, bbox_inches="tight")
 plt.show()
-print("Saved: core_sd_county_map.png")
+print("Saved: core_sd_county_map_2230.png")
 
-# ── 11. Inset map — zoomed into study areas ───────────────────────────────────
-fig2, ax2 = plt.subplots(figsize=(12, 10))
-ax2.set_aspect("auto")
+# ── 10. ZOOMED MAP — study areas only ────────────────────────────────────────
+fig2, ax2 = plt.subplots(figsize=(13, 11))
+ax2.set_aspect("equal")
 
-# Community planning districts (zoomed area)
 if has_cpd:
-    cpd.plot(ax=ax2, color="#f5f5f0", edgecolor="#cccccc",
+    cpd.plot(ax=ax2, color="#f0ede8", edgecolor="#c8c0b8",
              linewidth=0.5, alpha=0.9, zorder=1)
 
-# Business points
-if "industry_group" in core_gdf.columns:
+if has_ctx:
+    ctx.add_basemap(ax2, crs=core_gdf_2230.crs.to_string(),
+                    source=ctx.providers.CartoDB.Positron,
+                    zoom=13, alpha=0.6, zorder=0)
+
+if "industry_group" in core_gdf_2230.columns:
     for group_name, color in colors.items():
-        subset = core_gdf[core_gdf["industry_group"] == group_name]
+        subset = core_gdf_2230[core_gdf_2230["industry_group"] == group_name]
         if len(subset):
             ax2.scatter(subset.geometry.x, subset.geometry.y,
-                        c=color, s=12, alpha=0.8, zorder=3,
+                        c=color, s=14, alpha=0.85, zorder=4,
                         label=f"{group_name} (n={len(subset):,})")
 
-# Study area buffers (zoomed)
-for name, (x, y) in area_coords.items():
-    center = gpd.GeoDataFrame(
-        geometry=[Point(x, y)], crs="EPSG:4326"
-    ).to_crs("EPSG:26911")
-    buffer = center.geometry.buffer(1609).to_crs("EPSG:4326")
-    bx, by = buffer.iloc[0].exterior.xy
-    ax2.fill(bx, by, color="yellow", alpha=0.2, zorder=4)
-    ax2.plot(bx, by, color="black", linewidth=2.0,
-             linestyle="--", zorder=5)
-    ax2.annotate(name, xy=(x, y), fontsize=10,
-                 fontweight="bold", ha="center", color="black", zorder=6,
+for name, buf in buffers_2230.items():
+    bx, by = buf.exterior.xy
+    ax2.fill(bx, by, color="yellow", alpha=0.2, zorder=5)
+    ax2.plot(bx, by, color="black", linewidth=2.2,
+             linestyle="--", zorder=6)
+    cx, cy = centers_2230[name].x, centers_2230[name].y
+    ax2.annotate(name, xy=(cx, cy), fontsize=10,
+                 fontweight="bold", ha="center", color="black", zorder=7,
                  bbox=dict(boxstyle="round,pad=0.3", fc="white",
-                           ec="black", alpha=0.85, linewidth=1.0))
+                           ec="black", alpha=0.9, linewidth=1.0))
 
-# Zoom to study area extent with padding
-xs = [c[0] for c in area_coords.values()]
-ys = [c[1] for c in area_coords.values()]
-ax2.set_xlim(min(xs) - 0.15, max(xs) + 0.15)
-ax2.set_ylim(min(ys) - 0.10, max(ys) + 0.15)
+# Zoom extent to study areas
+all_buf_xs = [c.x for c in centers_2230.values()]
+all_buf_ys = [c.y for c in centers_2230.values()]
+pad = 10000  # feet
+ax2.set_xlim(min(all_buf_xs) - pad, max(all_buf_xs) + pad)
+ax2.set_ylim(min(all_buf_ys) - pad, max(all_buf_ys) + pad)
 
 ax2.set_title("Study Areas — Zoomed View\n"
-              "Core Industrial & Logistics Businesses by NAICS Sector",
+              "Core Industrial & Logistics Businesses by NAICS Sector | CRS: EPSG:2230",
               fontsize=13, fontweight="bold")
-ax2.legend(fontsize=9, loc="upper right",
-           framealpha=0.9, edgecolor="gray")
-ax2.set_xlabel("Longitude", fontsize=10)
-ax2.set_ylabel("Latitude", fontsize=10)
-ax2.grid(alpha=0.2, zorder=0)
+ax2.legend(fontsize=9, loc="upper right", framealpha=0.95, edgecolor="gray")
+ax2.set_xlabel("Easting (US Survey Feet)", fontsize=9)
+ax2.set_ylabel("Northing (US Survey Feet)", fontsize=9)
+ax2.grid(alpha=0.15, zorder=0)
 
 plt.tight_layout()
-plt.savefig("core_study_areas_zoom_map.png", dpi=150, bbox_inches="tight")
+plt.savefig("core_study_areas_zoom_2230.png", dpi=150, bbox_inches="tight")
 plt.show()
-print("Saved: core_study_areas_zoom_map.png")
+print("Saved: core_study_areas_zoom_2230.png")
 
-# ── 12. Business count summary per study area ─────────────────────────────────
+# ── 11. Business count summary ────────────────────────────────────────────────
 print("\n" + "=" * 65)
-print("BUSINESS COUNTS BY STUDY AREA (1-mile radius, core dataset)")
+print("BUSINESS COUNTS BY STUDY AREA (1-mile radius, EPSG:2230)")
 print("=" * 65)
 
-gdf_proj = core_gdf.to_crs("EPSG:26911")
 rows = []
-
-for area_name, (x, y) in area_coords.items():
-    center = gpd.GeoDataFrame(
-        geometry=[Point(x, y)], crs="EPSG:4326"
-    ).to_crs("EPSG:26911")
-    buffer_geom = center.geometry.buffer(1609).iloc[0]
-    subset = gdf_proj[gdf_proj.geometry.within(buffer_geom)]
+for area_name, buf_geom in buffers_2230.items():
+    subset = core_gdf_2230[core_gdf_2230.geometry.within(buf_geom)]
     counts = (subset["industry_group"].value_counts()
               if "industry_group" in subset.columns else {})
     rows.append({
@@ -241,5 +246,5 @@ summary["freight_pct"] = (
 ).round(1)
 
 print(summary.to_string(index=False))
-summary.to_csv("study_area_summary_core.csv", index=False)
-print("\nSaved: study_area_summary_core.csv")
+summary.to_csv("study_area_summary_core_2230.csv", index=False)
+print("\nSaved: study_area_summary_core_2230.csv")
