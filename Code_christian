@@ -44,21 +44,40 @@ print("Columns:")
 print(businesses.columns.tolist())
 
 # -----------------------------
-# 4. Filter by industrial/logistics NAICS
+# 4. Clean NAICS field
 # -----------------------------
-businesses["naics"] = businesses["naics"].astype(str).str.strip()
-
-industrial_prefixes = (
-    "31", "32", "33",   # Manufacturing
-    "42",               # Wholesale trade
-    "48", "49"          # Transportation and warehousing
+businesses["naics"] = (
+    businesses["naics"]
+    .astype(str)
+    .str.strip()
+    .str.replace(".0", "", regex=False)
 )
 
-industrial = businesses[
-    businesses["naics"].str.startswith(industrial_prefixes, na=False)
+# -----------------------------
+# 5. Initial broad NAICS filter
+# -----------------------------
+# 31-33 = Manufacturing
+# 42 = Wholesale trade
+# 48-49 = Transportation and warehousing
+
+broad_prefixes = (
+    "31", "32", "33",
+    "42",
+    "48", "49"
+)
+
+industrial_broad = businesses[
+    businesses["naics"].str.startswith(broad_prefixes, na=False)
 ].copy()
 
-def classify_industry(naics):
+print("Broad industrial/logistics businesses:", len(industrial_broad))
+
+# -----------------------------
+# 6. Classify broad industry groups
+# -----------------------------
+def classify_broad_industry(naics):
+    naics = str(naics).strip()
+
     if naics.startswith(("31", "32", "33")):
         return "Manufacturing"
     elif naics.startswith("42"):
@@ -68,32 +87,111 @@ def classify_industry(naics):
     else:
         return "Other"
 
-industrial["industry_group"] = industrial["naics"].apply(classify_industry)
+industrial_broad["industry_group"] = industrial_broad["naics"].apply(classify_broad_industry)
 
-print("Industrial/logistics businesses:", len(industrial))
-print(industrial["industry_group"].value_counts())
+print("\nBroad industry counts:")
+print(industrial_broad["industry_group"].value_counts())
+
+print("\nBroad NAICS 3-digit counts:")
+print(industrial_broad["naics"].str[:3].value_counts().sort_index())
 
 # -----------------------------
-# 5. Create full address
+# 7. Validate / refine industrial definition
 # -----------------------------
-industrial["full_address"] = (
-    industrial["address"].fillna("") + ", " +
-    industrial["city"].fillna("") + ", " +
-    industrial["state"].fillna("") + " " +
-    industrial["zip"].fillna("")
+# Keep:
+# 31-33 Manufacturing
+# 421/422/423/424 Wholesale/distribution
+# 481 Air transportation
+# 483 Water transportation
+# 484 Truck transportation
+# 488 Support activities for transportation
+# 491 Postal service
+# 492 Couriers/messengers
+# 493 Warehousing/storage
+#
+# Remove:
+# 485 Passenger transportation
+# 486 Pipeline transportation
+# 487 Scenic/sightseeing transportation
+# 425 Broker-only wholesale, if present
+
+exclude_prefixes = (
+    "425",
+    "485",
+    "486",
+    "487"
 )
 
-industrial = industrial[
-    industrial["full_address"].str.len() > 10
+keep_prefixes = (
+    "31", "32", "33",
+    "421", "422", "423", "424",
+    "481", "483", "484", "488", "491", "492", "493"
+)
+
+industrial_broad["keep_for_analysis"] = (
+    industrial_broad["naics"].str.startswith(keep_prefixes, na=False)
+    & ~industrial_broad["naics"].str.startswith(exclude_prefixes, na=False)
+)
+
+industrial_clean = industrial_broad[
+    industrial_broad["keep_for_analysis"]
+].copy()
+
+industrial_flagged = industrial_broad[
+    ~industrial_broad["keep_for_analysis"]
+].copy()
+
+print("\nClean industrial/logistics businesses:", len(industrial_clean))
+print("Flagged / excluded businesses:", len(industrial_flagged))
+
+print("\nClean industry counts:")
+print(industrial_clean["industry_group"].value_counts())
+
+print("\nFlagged NAICS 3-digit counts:")
+print(industrial_flagged["naics"].str[:3].value_counts().sort_index())
+
+# -----------------------------
+# 8. Export validation files before geocoding
+# -----------------------------
+industrial_broad.to_csv(
+    "industrial_businesses_broad_naics.csv",
+    index=False
+)
+
+industrial_clean.to_csv(
+    "industrial_businesses_clean_naics.csv",
+    index=False
+)
+
+industrial_flagged.to_csv(
+    "industrial_businesses_flagged_for_review.csv",
+    index=False
+)
+
+print("\nSaved validation CSVs:")
+print("industrial_businesses_broad_naics.csv")
+print("industrial_businesses_clean_naics.csv")
+print("industrial_businesses_flagged_for_review.csv")
+
+# -----------------------------
+# 9. Create full address for clean dataset
+# -----------------------------
+industrial_clean["full_address"] = (
+    industrial_clean["address"].fillna("") + ", " +
+    industrial_clean["city"].fillna("") + ", " +
+    industrial_clean["state"].fillna("") + " " +
+    industrial_clean["zip"].fillna("")
+)
+
+industrial_clean = industrial_clean[
+    industrial_clean["full_address"].str.len() > 10
 ].copy()
 
 # -----------------------------
-# 6. Geocode addresses
+# 10. Geocode clean industrial/logistics businesses
 # -----------------------------
-# Keep 100 while testing.
-# After confirming the CSV works in ArcGIS Online,
-# change to: sample = industrial.copy()
-sample = industrial.copy()
+# Use all clean records.
+sample = industrial_clean.copy()
 
 geocoded_results = batch_geocode(
     sample["full_address"].tolist(),
@@ -103,11 +201,11 @@ geocoded_results = batch_geocode(
 geo_sdf = geocoded_results.sdf.reset_index(drop=True)
 sample = sample.reset_index(drop=True)
 
-print("Geocoding preview:")
+print("\nGeocoding preview:")
 print(geo_sdf[["Status", "Score", "Match_addr", "X", "Y"]].head())
 
 # -----------------------------
-# 7. Add geocoding results to business records
+# 11. Add geocoding results
 # -----------------------------
 business_points = sample.copy()
 
@@ -127,17 +225,16 @@ business_points["latitude"] = pd.to_numeric(
     errors="coerce"
 )
 
-# Keep only successfully matched records with valid coordinates
 business_points = business_points[
     (business_points["geocode_status"] == "M")
     & business_points["longitude"].notna()
     & business_points["latitude"].notna()
 ].copy()
 
-print("Successfully geocoded businesses:", len(business_points))
+print("\nSuccessfully geocoded clean businesses:", len(business_points))
 
 # -----------------------------
-# 8. Keep useful columns for ArcGIS Online
+# 12. Keep useful columns for ArcGIS Online
 # -----------------------------
 output_cols = [
     "business_acctnum",
@@ -160,23 +257,31 @@ output_cols = [
 business_points = business_points[output_cols].copy()
 
 # -----------------------------
-# 9. Export CSV for ArcGIS Online upload
+# 13. Export final geocoded CSV
 # -----------------------------
-output_file = "industrial_businesses_geocoded.csv"
+output_file = "industrial_businesses_validated_geocoded.csv"
 
 business_points.to_csv(
     output_file,
     index=False
 )
 
-print(f"CSV exported successfully: {output_file}")
+print(f"\nCSV exported successfully: {output_file}")
 
 # -----------------------------
-# 10. Quick quality checks
+# 14. Final quality checks
 # -----------------------------
-print("Final row count:", len(business_points))
-print("Industry counts:")
+print("\nFinal row count:", len(business_points))
+
+print("\nFinal industry counts:")
 print(business_points["industry_group"].value_counts())
 
-print("Coordinate preview:")
-print(business_points[["dba_name", "industry_group", "longitude", "latitude"]].head())
+print("\nFinal NAICS 3-digit counts:")
+print(business_points["naics"].str[:3].value_counts().sort_index())
+
+print("\nCoordinate preview:")
+print(
+    business_points[
+        ["dba_name", "industry_group", "naics", "longitude", "latitude"]
+    ].head()
+)
