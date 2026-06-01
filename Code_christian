@@ -18,19 +18,14 @@ files = [
 
 businesses = pd.concat(
     [
-        pd.read_csv(
-            f,
-            dtype=str,
-            engine="python",
-            on_bad_lines="skip"
-        )
+        pd.read_csv(f, dtype=str, engine="python", on_bad_lines="skip")
         for f in files
     ],
     ignore_index=True
 )
 
 # -----------------------------
-# 3. Clean column names
+# 3. Clean columns
 # -----------------------------
 businesses.columns = (
     businesses.columns
@@ -40,12 +35,6 @@ businesses.columns = (
     .str.replace("#", "num")
 )
 
-print("Columns:")
-print(businesses.columns.tolist())
-
-# -----------------------------
-# 4. Clean NAICS field
-# -----------------------------
 businesses["naics"] = (
     businesses["naics"]
     .astype(str)
@@ -54,234 +43,157 @@ businesses["naics"] = (
 )
 
 # -----------------------------
-# 5. Initial broad NAICS filter
+# 4. Industry classifier
 # -----------------------------
-# 31-33 = Manufacturing
-# 42 = Wholesale trade
-# 48-49 = Transportation and warehousing
-
-broad_prefixes = (
-    "31", "32", "33",
-    "42",
-    "48", "49"
-)
-
-industrial_broad = businesses[
-    businesses["naics"].str.startswith(broad_prefixes, na=False)
-].copy()
-
-print("Broad industrial/logistics businesses:", len(industrial_broad))
-
-# -----------------------------
-# 6. Classify broad industry groups
-# -----------------------------
-def classify_broad_industry(naics):
+def classify_industry(naics):
     naics = str(naics).strip()
 
     if naics.startswith(("31", "32", "33")):
         return "Manufacturing"
-    elif naics.startswith("42"):
+    elif naics.startswith(("421", "422", "423", "424", "42")):
         return "Wholesale Trade"
     elif naics.startswith(("48", "49")):
         return "Transportation and Warehousing"
+    elif naics.startswith("8113"):
+        return "Industrial Machinery Repair"
     else:
         return "Other"
 
-industrial_broad["industry_group"] = industrial_broad["naics"].apply(classify_broad_industry)
+# -----------------------------
+# 5. Define broad and core filters
+# -----------------------------
+# Broad = includes likely industrial ecosystem categories
+broad_prefixes = (
+    "31", "32", "33",      # Manufacturing
+    "42",                  # Wholesale trade
+    "48", "49",            # Transportation/warehousing
+    "8113"                 # Industrial machinery/equipment repair
+)
 
-print("\nBroad industry counts:")
+# Core = excludes passenger/scenic/pipeline and broker-only categories
+core_keep_prefixes = (
+    "31", "32", "33",      # Manufacturing
+    "421", "422", "423", "424",  # Wholesale/distribution
+    "481", "483", "484", "488", "491", "492", "493",  # Freight/logistics
+    "8113"                 # Industrial machinery/equipment repair
+)
+
+core_exclude_prefixes = (
+    "425",  # Wholesale brokers/electronic markets
+    "485",  # Passenger transportation
+    "486",  # Pipeline transportation
+    "487"   # Scenic/sightseeing transportation
+)
+
+# -----------------------------
+# 6. Create broad dataset
+# -----------------------------
+industrial_broad = businesses[
+    businesses["naics"].str.startswith(broad_prefixes, na=False)
+].copy()
+
+industrial_broad["definition"] = "Broad"
+industrial_broad["industry_group"] = industrial_broad["naics"].apply(classify_industry)
+
+# -----------------------------
+# 7. Create core dataset
+# -----------------------------
+industrial_core = industrial_broad[
+    industrial_broad["naics"].str.startswith(core_keep_prefixes, na=False)
+    & ~industrial_broad["naics"].str.startswith(core_exclude_prefixes, na=False)
+].copy()
+
+industrial_core["definition"] = "Core"
+industrial_core["industry_group"] = industrial_core["naics"].apply(classify_industry)
+
+# -----------------------------
+# 8. Print validation summaries
+# -----------------------------
+print("Broad businesses:", len(industrial_broad))
 print(industrial_broad["industry_group"].value_counts())
+
+print("\nCore businesses:", len(industrial_core))
+print(industrial_core["industry_group"].value_counts())
 
 print("\nBroad NAICS 3-digit counts:")
 print(industrial_broad["naics"].str[:3].value_counts().sort_index())
 
-# -----------------------------
-# 7. Validate / refine industrial definition
-# -----------------------------
-# Keep:
-# 31-33 Manufacturing
-# 421/422/423/424 Wholesale/distribution
-# 481 Air transportation
-# 483 Water transportation
-# 484 Truck transportation
-# 488 Support activities for transportation
-# 491 Postal service
-# 492 Couriers/messengers
-# 493 Warehousing/storage
-#
-# Remove:
-# 485 Passenger transportation
-# 486 Pipeline transportation
-# 487 Scenic/sightseeing transportation
-# 425 Broker-only wholesale, if present
+print("\nCore NAICS 3-digit counts:")
+print(industrial_core["naics"].str[:3].value_counts().sort_index())
 
-exclude_prefixes = (
-    "425",
-    "485",
-    "486",
-    "487"
+# -----------------------------
+# 9. Geocoding function
+# -----------------------------
+def geocode_and_export(df, output_file):
+    df = df.copy()
+
+    df["full_address"] = (
+        df["address"].fillna("") + ", " +
+        df["city"].fillna("") + ", " +
+        df["state"].fillna("") + " " +
+        df["zip"].fillna("")
+    )
+
+    df = df[df["full_address"].str.len() > 10].copy()
+    df = df.reset_index(drop=True)
+
+    geocoded_results = batch_geocode(
+        df["full_address"].tolist(),
+        as_featureset=True
+    )
+
+    geo_sdf = geocoded_results.sdf.reset_index(drop=True)
+
+    df["longitude"] = pd.to_numeric(geo_sdf["X"], errors="coerce")
+    df["latitude"] = pd.to_numeric(geo_sdf["Y"], errors="coerce")
+    df["geocode_score"] = geo_sdf["Score"]
+    df["matched_address"] = geo_sdf["Match_addr"]
+    df["geocode_status"] = geo_sdf["Status"]
+
+    df = df[
+        (df["geocode_status"] == "M")
+        & df["longitude"].notna()
+        & df["latitude"].notna()
+    ].copy()
+
+    output_cols = [
+        "business_acctnum",
+        "dba_name",
+        "ownership_type",
+        "address",
+        "city",
+        "state",
+        "zip",
+        "naics",
+        "activity_desc",
+        "industry_group",
+        "definition",
+        "full_address",
+        "matched_address",
+        "geocode_score",
+        "longitude",
+        "latitude"
+    ]
+
+    df = df[output_cols].copy()
+
+    df.to_csv(output_file, index=False)
+
+    print(f"\nExported: {output_file}")
+    print("Final row count:", len(df))
+    print(df["industry_group"].value_counts())
+
+    return df
+
+# -----------------------------
+# 10. Geocode and export both datasets
+# -----------------------------
+core_points = geocode_and_export(
+    industrial_core,
+    "industrial_businesses_core_geocoded.csv"
 )
 
-keep_prefixes = (
-    "31", "32", "33",
-    "421", "422", "423", "424",
-    "481", "483", "484", "488", "491", "492", "493"
-)
-
-industrial_broad["keep_for_analysis"] = (
-    industrial_broad["naics"].str.startswith(keep_prefixes, na=False)
-    & ~industrial_broad["naics"].str.startswith(exclude_prefixes, na=False)
-)
-
-industrial_clean = industrial_broad[
-    industrial_broad["keep_for_analysis"]
-].copy()
-
-industrial_flagged = industrial_broad[
-    ~industrial_broad["keep_for_analysis"]
-].copy()
-
-print("\nClean industrial/logistics businesses:", len(industrial_clean))
-print("Flagged / excluded businesses:", len(industrial_flagged))
-
-print("\nClean industry counts:")
-print(industrial_clean["industry_group"].value_counts())
-
-print("\nFlagged NAICS 3-digit counts:")
-print(industrial_flagged["naics"].str[:3].value_counts().sort_index())
-
-# -----------------------------
-# 8. Export validation files before geocoding
-# -----------------------------
-industrial_broad.to_csv(
-    "industrial_businesses_broad_naics.csv",
-    index=False
-)
-
-industrial_clean.to_csv(
-    "industrial_businesses_clean_naics.csv",
-    index=False
-)
-
-industrial_flagged.to_csv(
-    "industrial_businesses_flagged_for_review.csv",
-    index=False
-)
-
-print("\nSaved validation CSVs:")
-print("industrial_businesses_broad_naics.csv")
-print("industrial_businesses_clean_naics.csv")
-print("industrial_businesses_flagged_for_review.csv")
-
-# -----------------------------
-# 9. Create full address for clean dataset
-# -----------------------------
-industrial_clean["full_address"] = (
-    industrial_clean["address"].fillna("") + ", " +
-    industrial_clean["city"].fillna("") + ", " +
-    industrial_clean["state"].fillna("") + " " +
-    industrial_clean["zip"].fillna("")
-)
-
-industrial_clean = industrial_clean[
-    industrial_clean["full_address"].str.len() > 10
-].copy()
-
-# -----------------------------
-# 10. Geocode clean industrial/logistics businesses
-# -----------------------------
-# Use all clean records.
-sample = industrial_clean.copy()
-
-geocoded_results = batch_geocode(
-    sample["full_address"].tolist(),
-    as_featureset=True
-)
-
-geo_sdf = geocoded_results.sdf.reset_index(drop=True)
-sample = sample.reset_index(drop=True)
-
-print("\nGeocoding preview:")
-print(geo_sdf[["Status", "Score", "Match_addr", "X", "Y"]].head())
-
-# -----------------------------
-# 11. Add geocoding results
-# -----------------------------
-business_points = sample.copy()
-
-business_points["longitude"] = geo_sdf["X"]
-business_points["latitude"] = geo_sdf["Y"]
-business_points["geocode_score"] = geo_sdf["Score"]
-business_points["matched_address"] = geo_sdf["Match_addr"]
-business_points["geocode_status"] = geo_sdf["Status"]
-
-business_points["longitude"] = pd.to_numeric(
-    business_points["longitude"],
-    errors="coerce"
-)
-
-business_points["latitude"] = pd.to_numeric(
-    business_points["latitude"],
-    errors="coerce"
-)
-
-business_points = business_points[
-    (business_points["geocode_status"] == "M")
-    & business_points["longitude"].notna()
-    & business_points["latitude"].notna()
-].copy()
-
-print("\nSuccessfully geocoded clean businesses:", len(business_points))
-
-# -----------------------------
-# 12. Keep useful columns for ArcGIS Online
-# -----------------------------
-output_cols = [
-    "business_acctnum",
-    "dba_name",
-    "ownership_type",
-    "address",
-    "city",
-    "state",
-    "zip",
-    "naics",
-    "activity_desc",
-    "industry_group",
-    "full_address",
-    "matched_address",
-    "geocode_score",
-    "longitude",
-    "latitude"
-]
-
-business_points = business_points[output_cols].copy()
-
-# -----------------------------
-# 13. Export final geocoded CSV
-# -----------------------------
-output_file = "industrial_businesses_validated_geocoded.csv"
-
-business_points.to_csv(
-    output_file,
-    index=False
-)
-
-print(f"\nCSV exported successfully: {output_file}")
-
-# -----------------------------
-# 14. Final quality checks
-# -----------------------------
-print("\nFinal row count:", len(business_points))
-
-print("\nFinal industry counts:")
-print(business_points["industry_group"].value_counts())
-
-print("\nFinal NAICS 3-digit counts:")
-print(business_points["naics"].str[:3].value_counts().sort_index())
-
-print("\nCoordinate preview:")
-print(
-    business_points[
-        ["dba_name", "industry_group", "naics", "longitude", "latitude"]
-    ].head()
+broad_points = geocode_and_export(
+    industrial_broad,
+    "industrial_businesses_broad_geocoded.csv"
 )
