@@ -15,10 +15,14 @@ TRACT_URL = "https://www2.census.gov/geo/tiger/GENZ2023/shp/cb_2023_06_tract_500
 MAJOR_ROADS_URL = "https://gis.sandag.org/FreightViewer/data/MajorRoads_20171002.json"
 GADM_FILE = "gadm41_USA_2.json"
 
+# Change this to match your uploaded planning district file name
+PLANNING_AREAS_FILE = "Community_Plan_SD.geojson"
+
 def inspect_gdf(gdf, name):
     print(f"\n{name}")
     print("Rows:", len(gdf))
     print("CRS:", gdf.crs)
+    print("Columns:", gdf.columns.tolist())
     print(gdf.head())
 
 # ============================================================
@@ -117,8 +121,7 @@ print("\nCore businesses:", len(industrial_core))
 print(industrial_core["industry_group"].value_counts())
 
 # ============================================================
-# 5. Load San Diego County Census tracts
-#    Used for tract-level assignment and San Diego County filtering
+# 5. Load San Diego County census tracts
 # ============================================================
 tracts_ca = gpd.read_file(TRACT_URL)
 
@@ -131,11 +134,10 @@ tracts_sd = (
 tracts_sd["GEOID"] = tracts_sd["GEOID"].astype(str)
 tracts_sd["area_sqmi"] = tracts_sd.geometry.area / (FT_PER_MILE ** 2)
 
-inspect_gdf(tracts_sd, "San Diego County census tracts (2023)")
+inspect_gdf(tracts_sd, "San Diego County census tracts")
 
 # ============================================================
 # 6. Load GADM San Diego County boundary
-#    Used for county outline / map reference / optional clipping
 # ============================================================
 counties = gpd.read_file(GADM_FILE)
 
@@ -148,11 +150,40 @@ sd_county = sd_county.to_crs(TARGET_CRS)
 
 inspect_gdf(sd_county, "GADM San Diego County boundary")
 
-# Optional: export county outline for ArcGIS / StoryMap use
 sd_county.to_file("san_diego_county_gadm.geojson", driver="GeoJSON")
 
 # ============================================================
-# 7. Function: geocode, filter to San Diego County tracts, and export
+# 7. Load Community Planning District Boundaries
+# ============================================================
+planning_areas = gpd.read_file(PLANNING_AREAS_FILE)
+
+if planning_areas.crs is None:
+    planning_areas = planning_areas.set_crs("EPSG:4326")
+
+planning_areas = planning_areas.to_crs(TARGET_CRS)
+
+inspect_gdf(planning_areas, "Community Planning District Boundaries")
+
+# ============================================================
+# Planning area name field
+# ============================================================
+
+planning_areas = planning_areas.rename(
+    columns={"CPNAME": "planning_area"}
+)
+
+print(
+    planning_areas["planning_area"]
+    .sort_values()
+    .unique()
+)
+
+planning_areas = planning_areas.rename(
+    columns={planning_name_col: "planning_area"}
+)
+
+# ============================================================
+# 8. Function: geocode, county-filter, assign planning area
 # ============================================================
 def geocode_filter_export(df, output_file):
     df = df.copy()
@@ -190,16 +221,11 @@ def geocode_filter_export(df, output_file):
 
     businesses_gdf = gpd.GeoDataFrame(
         df,
-        geometry=gpd.points_from_xy(
-            df["longitude"],
-            df["latitude"]
-        ),
+        geometry=gpd.points_from_xy(df["longitude"], df["latitude"]),
         crs="EPSG:4326"
-    )
+    ).to_crs(TARGET_CRS)
 
-    businesses_gdf = businesses_gdf.to_crs(TARGET_CRS)
-
-    # Keep only businesses located within San Diego County census tracts
+    # Keep only businesses inside San Diego County census tracts
     businesses_gdf = gpd.sjoin(
         businesses_gdf,
         tracts_sd[["GEOID", "geometry"]],
@@ -212,15 +238,27 @@ def geocode_filter_export(df, output_file):
 
     businesses_gdf = businesses_gdf.rename(columns={"GEOID": "tract_geoid"})
 
-    # Convert back to WGS84 for ArcGIS CSV upload
-    businesses_gdf = businesses_gdf.to_crs("EPSG:4326")
+    print("Businesses inside San Diego County census tracts:", len(businesses_gdf))
 
-    df = pd.DataFrame(
-        businesses_gdf.drop(columns="geometry")
+    # Assign planning area
+    businesses_gdf = gpd.sjoin(
+        businesses_gdf,
+        planning_areas[["planning_area", "geometry"]],
+        how="left",
+        predicate="within"
     )
 
-    print("Businesses inside San Diego County census tracts:", len(df))
-    print(df["city"].value_counts().head(20))
+    if "index_right" in businesses_gdf.columns:
+        businesses_gdf = businesses_gdf.drop(columns=["index_right"])
+
+    businesses_gdf["planning_area"] = businesses_gdf["planning_area"].fillna("Outside City Planning Areas")
+
+    # Convert back to WGS84 for CSV/ArcGIS upload
+    businesses_gdf = businesses_gdf.to_crs("EPSG:4326")
+
+    df = pd.DataFrame(businesses_gdf.drop(columns="geometry"))
+
+    print(df["planning_area"].value_counts().head(20))
 
     output_cols = [
         "business_acctnum",
@@ -235,6 +273,7 @@ def geocode_filter_export(df, output_file):
         "industry_group",
         "definition",
         "tract_geoid",
+        "planning_area",
         "full_address",
         "matched_address",
         "geocode_score",
@@ -252,7 +291,7 @@ def geocode_filter_export(df, output_file):
     return df
 
 # ============================================================
-# 8. Geocode, filter, and export both datasets
+# 9. Geocode, filter, and export both datasets
 # ============================================================
 core_points = geocode_filter_export(
     industrial_core,
@@ -265,7 +304,7 @@ broad_points = geocode_filter_export(
 )
 
 # ============================================================
-# 9. Load SANDAG major freight roads once
+# 10. Load SANDAG major freight roads
 # ============================================================
 roads_gdf = gpd.read_file(MAJOR_ROADS_URL)
 
@@ -277,9 +316,9 @@ roads_proj = roads_gdf.to_crs(TARGET_CRS)
 inspect_gdf(roads_proj, "SANDAG major freight roads")
 
 # ============================================================
-# 10. Function: calculate distance to nearest freight road
+# 11. Function: distance to nearest freight road + comparisons
 # ============================================================
-def distance_to_freight_roads(input_csv, output_csv):
+def distance_to_freight_roads(input_csv, output_csv, definition_label):
     businesses = pd.read_csv(input_csv)
 
     business_gdf = gpd.GeoDataFrame(
@@ -289,12 +328,10 @@ def distance_to_freight_roads(input_csv, output_csv):
             businesses["latitude"]
         ),
         crs="EPSG:4326"
-    )
-
-    business_proj = business_gdf.to_crs(TARGET_CRS)
+    ).to_crs(TARGET_CRS)
 
     nearest = gpd.sjoin_nearest(
-        business_proj,
+        business_gdf,
         roads_proj,
         how="left",
         distance_col="dist_to_freight_road_m"
@@ -304,33 +341,109 @@ def distance_to_freight_roads(input_csv, output_csv):
         nearest["dist_to_freight_road_m"] / METERS_PER_MILE
     )
 
-    nearest.to_csv(output_csv, index=False)
-
-    print(f"\nExported: {output_csv}")
-
-    print("Average distance to freight road, miles:")
-    print(nearest["dist_to_freight_road_mi"].mean())
-
-    print("\nMedian distance to freight road, miles:")
-    print(nearest["dist_to_freight_road_mi"].median())
-
-    print("\nBy industry group:")
-    print(
-        nearest.groupby("industry_group")["dist_to_freight_road_mi"]
-        .agg(["count", "mean", "median", "min", "max"])
+    nearest["distance_category"] = pd.cut(
+        nearest["dist_to_freight_road_mi"],
+        bins=[0, 0.25, 0.5, 1, 2, nearest["dist_to_freight_road_mi"].max()],
+        labels=["0–0.25 mi", "0.25–0.5 mi", "0.5–1 mi", "1–2 mi", "2+ mi"],
+        include_lowest=True
     )
 
-    return nearest
+    nearest["is_otay_mesa"] = nearest["planning_area"].str.contains(
+        "Otay Mesa",
+        case=False,
+        na=False
+    )
+
+    nearest["comparison_area"] = nearest["is_otay_mesa"].map({
+        True: "Otay Mesa",
+        False: "Other San Diego Areas"
+    })
+
+    # Export full results
+    nearest.to_csv(output_csv, index=False)
+
+    nearest.to_crs("EPSG:4326").to_file(
+        output_csv.replace(".csv", ".geojson"),
+        driver="GeoJSON"
+    )
+
+    # Overall summary
+    overall_summary = pd.DataFrame({
+        "definition": [definition_label],
+        "total_businesses": [len(nearest)],
+        "mean_distance_mi": [nearest["dist_to_freight_road_mi"].mean()],
+        "median_distance_mi": [nearest["dist_to_freight_road_mi"].median()],
+        "min_distance_mi": [nearest["dist_to_freight_road_mi"].min()],
+        "max_distance_mi": [nearest["dist_to_freight_road_mi"].max()]
+    })
+
+    overall_summary.to_csv(
+        output_csv.replace(".csv", "_overall_summary.csv"),
+        index=False
+    )
+
+    # By industry
+    industry_summary = (
+        nearest.groupby("industry_group")["dist_to_freight_road_mi"]
+        .agg(["count", "mean", "median", "min", "max"])
+        .reset_index()
+    )
+
+    industry_summary.to_csv(
+        output_csv.replace(".csv", "_summary_by_industry.csv"),
+        index=False
+    )
+
+    # By planning area
+    planning_summary = (
+        nearest.groupby("planning_area")["dist_to_freight_road_mi"]
+        .agg(["count", "mean", "median", "min", "max"])
+        .reset_index()
+        .sort_values("mean")
+    )
+
+    planning_summary.to_csv(
+        output_csv.replace(".csv", "_summary_by_planning_area.csv"),
+        index=False
+    )
+
+    # Otay Mesa vs other areas
+    otay_summary = (
+        nearest.groupby("comparison_area")["dist_to_freight_road_mi"]
+        .agg(["count", "mean", "median", "min", "max"])
+        .reset_index()
+    )
+
+    otay_summary.to_csv(
+        output_csv.replace(".csv", "_otay_vs_other_summary.csv"),
+        index=False
+    )
+
+    print(f"\nExported: {output_csv}")
+    print("\nOverall summary:")
+    print(overall_summary)
+
+    print("\nOtay Mesa vs Other San Diego Areas:")
+    print(otay_summary)
+
+    print("\nTop planning areas by business count:")
+    print(
+        planning_summary.sort_values("count", ascending=False).head(10)
+    )
+
+    return nearest, overall_summary, industry_summary, planning_summary, otay_summary
 
 # ============================================================
-# 11. Run distance analysis for core and broad datasets
+# 12. Run distance analysis
 # ============================================================
-core_nearest = distance_to_freight_roads(
+core_nearest, core_overall, core_industry, core_planning, core_otay = distance_to_freight_roads(
     "industrial_businesses_core_geocoded.csv",
-    "industrial_businesses_core_distance_to_freight_roads.csv"
+    "industrial_businesses_core_distance_to_freight_roads.csv",
+    "Core"
 )
 
-broad_nearest = distance_to_freight_roads(
+broad_nearest, broad_overall, broad_industry, broad_planning, broad_otay = distance_to_freight_roads(
     "industrial_businesses_broad_geocoded.csv",
-    "industrial_businesses_broad_distance_to_freight_roads.csv"
+    "industrial_businesses_broad_distance_to_freight_roads.csv",
+    "Broad"
 )
