@@ -28,7 +28,7 @@
 # |------|------------|
 # | Christian Phouasalith | gpec447sp26_23 |
 # | Joseph Hurr | gpec447sp26_11 |
-# | Canyu Li | *add ID* |
+# | Canyu Li | gpec447sp26_14 |
 #
 # > **Notebook structure.** This report summarizes the project across all 12 required sections. The detailed analysis lives in three component notebooks, each runnable independently:
 # > - **`Code_christian.ipynb`** — business geocoding (raw license CSVs → NAICS classification → ArcGIS geocode → county/planning join → distance-to-freight-road)
