@@ -1239,4 +1239,4 @@ print("\nFull analysis: run Code_Joseph.ipynb and Code_canyu_June_7th.ipynb")
 #
 # ---
 # *Notebook prepared for GPEC 447, UC San Diego, Spring 2026.*
-#
+# AI Discretion: LLMs were used to iterate and compile group member codes. Manual checks were performed to reassure output accuracy and that the notebook is able to fully run from beginning to end.
