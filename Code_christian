@@ -132,7 +132,7 @@ tracts_sd = (
 )
 
 tracts_sd["GEOID"] = tracts_sd["GEOID"].astype(str)
-tracts_sd["area_sqmi"] = tracts_sd.geometry.area / (FT_PER_MILE ** 2)
+tracts_sd["area_sqmi"] = tracts_sd.geometry.area / (METERS_PER_MILE ** 2)
 
 inspect_gdf(tracts_sd, "San Diego County census tracts")
 
@@ -176,10 +176,6 @@ print(
     planning_areas["planning_area"]
     .sort_values()
     .unique()
-)
-
-planning_areas = planning_areas.rename(
-    columns={planning_name_col: "planning_area"}
 )
 
 # ============================================================
